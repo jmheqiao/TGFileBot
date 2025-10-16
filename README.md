@@ -12,6 +12,7 @@ This project is a Telegram bot that generates direct download links for files in
 - 支持在线播放和断点续传
 - 支持多用户管理
 - 支持自定义直链 hash 长度
+- 新增：通过 /phone 命令安全设置并本地保存 User Bot 手机号
 
 ## 技术栈 | Tech Stack
 - Go 1.21+
@@ -43,13 +44,22 @@ This project is a Telegram bot that generates direct download links for files in
 - `HASH_LENGTH`：直链 hash 长度，默认 6
 - `ALLOWED_USERS`：管理机器人的 Telegram 用户 ID，逗号分隔
 - `USE_USER_BOT`：是否启用 User Bot（使用你的个人账号读取频道消息，以提升兼容性）
-- `PHONE_NUMBER`：仅在 USE_USER_BOT=true 时需要填写，User Bot账号使用的手机号
+- `PHONE_NUMBER`：仅在 USE_USER_BOT=true 时使用。可直接在环境变量中提供，或留空后通过机器人 /phone 命令设置（将加密保存到本地）。
 
 ## 使用示例 | Usage Example
 1. 向 Bot 发送文件或转发频道/群组中的文件、或 telegram 链接（User Bot 对应账号必须加入分享链接所在频道/群组）
 2. Bot 回复直链下载地址
 3. 通过直链可直接下载或在线播放文件
-4. 通过 /ban 或 /unban id 方式控制用户权限
+4. 管理命令：/ban <id>、/unban <id>、/phone <手机号>
+
+### 使用 /phone 管理 User Bot 手机号
+- 前提：`.env` 中设置 `USE_USER_BOT=true`，并在 `ADMIN_USERS` 中包含你的 Telegram 用户 ID（只有管理员可用该命令）。
+- 方式一：在 `.env` 中设置 `PHONE_NUMBER`，服务启动时直接使用。
+- 方式二：留空 `PHONE_NUMBER`，启动服务后在与机器人私聊发送：
+  - `/phone +8613800138000`
+  - 机器人会将手机号使用 AES-GCM 加密保存到本地 `phone.enc`，下次启动自动读取。
+  - 若当时 `User Bot` 未启动，设置成功后会尝试立即启动。
+- 安全说明：加密密钥由 `API_HASH + BOT_TOKEN + TELE_ID` 派生；若这些参数变动，历史 `phone.enc` 将无法解密，需要重新设置。
 
 ## 常见问题 | FAQ
 - **Q: LOG_CHANNEL 必须是频道吗？**

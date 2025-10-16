@@ -3,7 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/md5"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/gob"
 	"encoding/hex"
 	"encoding/json"
@@ -47,7 +51,6 @@ type Config struct {
 	HashLength   int
 	AdminUsers   []int64
 	TeleID       int64  // 机器人用户ID
-	UseUserBot   bool   // 是否使用 User Bot
 	PhoneNumber  string // User Bot 手机号（可选）
 }
 
@@ -179,11 +182,6 @@ func StartClient() error {
 
 // StartUserBot 启动 User Bot 客户端
 func StartUserBot() error {
-	if !config.UseUserBot {
-		log.Println("未启用 User Bot，跳过")
-		return nil
-	}
-
 	log.Println("正在启动 User Bot...")
 
 	clientOpts := &gotgproto.ClientOpts{
@@ -215,6 +213,8 @@ func LoadCommands(d dispatcher.Dispatcher) {
 	d.AddHandler(handlers.NewCommand("start", handleStart))
 	d.AddHandler(handlers.NewCommand("ban", handleBan))
 	d.AddHandler(handlers.NewCommand("unban", handleUnban))
+	// 新增 /phone 命令
+	d.AddHandler(handlers.NewCommand("phone", handlePhone))
 	d.AddHandler(handlers.NewMessage(nil, handleMessage))
 	log.Println("命令处理器已加载")
 }
@@ -287,6 +287,86 @@ func handleUnban(ctx *ext.Context, u *ext.Update) error {
 	return dispatcher.EndGroups
 }
 
+// /phone 命令：/phone <手机号>
+func handlePhone(ctx *ext.Context, u *ext.Update) error {
+	adminID := u.EffectiveChat().GetID()
+	if !isAdmin(adminID) {
+		_, _ = ctx.Reply(u, "无权执行此命令（仅限管理员）", nil)
+		return dispatcher.EndGroups
+	}
+
+	args := strings.Fields(strings.TrimSpace(u.EffectiveMessage.Text))
+	if len(args) < 2 {
+		masked := maskPhone(config.PhoneNumber)
+		msg := "用法: /phone <手机号>\n示例: /phone +8613800138000"
+		if masked != "" {
+			msg += fmt.Sprintf("\n当前已保存: %s", masked)
+		}
+		_, _ = ctx.Reply(u, msg, nil)
+		return dispatcher.EndGroups
+	}
+
+	phone := strings.TrimSpace(args[1])
+	if !validPhone(phone) {
+		_, _ = ctx.Reply(u, "手机号格式不正确，请使用国际区号格式，例如 +8613800138000", nil)
+		return dispatcher.EndGroups
+	}
+
+	if err := savePhoneEncrypted(phone); err != nil {
+		log.Printf("保存加密手机号失败: %v", err)
+		_, _ = ctx.Reply(u, "保存失败，请查看服务端日志", nil)
+		return dispatcher.EndGroups
+	}
+
+	config.PhoneNumber = phone
+
+	// 若启用了 User Bot 且尚未启动，则尝试立即启动
+	if config.PhoneNumber != "" && UserBot == nil {
+		if err := StartUserBot(); err != nil {
+			log.Printf("设置手机号后启动 User Bot 失败: %v", err)
+			_, _ = ctx.Reply(u, "号码已保存，但启动 User Bot 失败，请查看日志或稍后重试", nil)
+			return dispatcher.EndGroups
+		}
+		_, _ = ctx.Reply(u, "手机号已保存，User Bot 已启动。", nil)
+		return dispatcher.EndGroups
+	}
+
+	_, _ = ctx.Reply(u, "手机号已保存。若已在运行，将在下次重启后生效。", nil)
+	return dispatcher.EndGroups
+}
+
+func validPhone(p string) bool {
+	if p == "" {
+		return false
+	}
+	// 简单校验：可选的+开头，后续为8-20位数字
+	if p[0] == '+' {
+		p = p[1:]
+	}
+	if len(p) < 8 || len(p) > 20 {
+		return false
+	}
+	for _, ch := range p {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func maskPhone(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return ""
+	}
+	runes := []rune(p)
+	if len(runes) <= 4 {
+		return "****"
+	}
+	return string(runes[:2]) + strings.Repeat("*", len(runes)-4) + string(runes[len(runes)-2:])
+}
+
+// 恢复 /start 处理器
 func handleStart(ctx *ext.Context, u *ext.Update) error {
 	chatId := u.EffectiveChat().GetID()
 	peerChatId := ctx.PeerStorage.GetPeerById(chatId)
@@ -312,6 +392,20 @@ func handleStart(ctx *ext.Context, u *ext.Update) error {
 	return dispatcher.EndGroups
 }
 
+// 恢复媒体过滤函数
+func supportedMediaFilter(m *types.Message) (bool, error) {
+	if m.Media == nil {
+		return false, dispatcher.EndGroups
+	}
+	switch m.Media.(type) {
+	case *tg.MessageMediaDocument, *tg.MessageMediaPhoto:
+		return true, nil
+	default:
+		return false, dispatcher.EndGroups
+	}
+}
+
+// 恢复通用消息处理
 func handleMessage(ctx *ext.Context, u *ext.Update) error {
 	chatId := u.EffectiveChat().GetID()
 	peerChatId := ctx.PeerStorage.GetPeerById(chatId)
@@ -415,18 +509,6 @@ func handleMessage(ctx *ext.Context, u *ext.Update) error {
 	}
 
 	return dispatcher.EndGroups
-}
-
-func supportedMediaFilter(m *types.Message) (bool, error) {
-	if m.Media == nil {
-		return false, dispatcher.EndGroups
-	}
-	switch m.Media.(type) {
-	case *tg.MessageMediaDocument, *tg.MessageMediaPhoto:
-		return true, nil
-	default:
-		return false, dispatcher.EndGroups
-	}
 }
 
 // ============================================================================
@@ -644,7 +726,7 @@ func handleTelegramUsernameLink(ctx *ext.Context, u *ext.Update, username string
 func getTGMessageFromUsername(ctx context.Context, client *gotgproto.Client, username string, messageID int) (*tg.Message, int64, error) {
 	// 如果启用了 User Bot，优先使用 User Bot 获取消息
 	var useClient *gotgproto.Client
-	if config.UseUserBot && UserBot != nil {
+	if config.PhoneNumber != "" && UserBot != nil {
 		useClient = UserBot
 		log.Printf("使用 User Bot 获取消息 (username)\n")
 	} else {
@@ -710,7 +792,7 @@ func getTGMessageFromChannel(ctx context.Context, client *gotgproto.Client, chan
 
 	// 如果启用了 User Bot，优先使用 User Bot 获取消息
 	var useClient *gotgproto.Client
-	if config.UseUserBot && UserBot != nil {
+	if config.PhoneNumber != "" && UserBot != nil {
 		useClient = UserBot
 		log.Printf("使用 User Bot 获取消息\n")
 	} else {
@@ -1246,7 +1328,7 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 		if channelID != 0 {
 			// 从原频道读取，优先使用 User Bot 下载（其拥有源频道访问权限），并支持自动刷新文件引用
 			readerClient := Bot
-			if config.UseUserBot && UserBot != nil {
+			if config.PhoneNumber != "" && UserBot != nil {
 				readerClient = UserBot
 			}
 			reader = newTelegramReaderWithRefresh(r.Context(), readerClient, file.Location, start, end, contentLength, channelID, messageID)
@@ -1339,6 +1421,88 @@ func (b *Blacklist) Unban(id int64) bool {
 }
 
 var blacklist = NewBlacklist("blacklist.json")
+
+// ============================================================================
+// 加密存储：User Bot 手机号
+// ============================================================================
+
+const phoneFile = "phone.enc"
+
+func derivePhoneKey() ([]byte, error) {
+	// 由 API_HASH + BOT_TOKEN + TELE_ID 派生密钥（32字节）
+	if config == nil {
+		return nil, errors.New("配置未初始化")
+	}
+	data := fmt.Sprintf("%s:%s:%d", strings.TrimSpace(config.ApiHash), strings.TrimSpace(config.BotToken), config.TeleID)
+	sum := sha256.Sum256([]byte(data))
+	return sum[:], nil
+}
+
+func savePhoneEncrypted(phone string) error {
+	key, err := derivePhoneKey()
+	if err != nil {
+		return err
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return err
+	}
+	ciphertext := gcm.Seal(nil, nonce, []byte(phone), nil)
+	// 文件格式: 4字节魔数 + 1字节版本 + nonce + ciphertext
+	buf := bytes.NewBuffer(nil)
+	buf.Write([]byte{'P', 'H', 'O', 'N'})
+	buf.WriteByte(1)
+	buf.Write(nonce)
+	buf.Write(ciphertext)
+	return os.WriteFile(phoneFile, buf.Bytes(), 0600)
+}
+
+func loadPhoneEncrypted() (string, error) {
+	data, err := os.ReadFile(phoneFile)
+	if err != nil {
+		return "", err
+	}
+	if len(data) < 5 {
+		return "", errors.New("phone.enc 文件损坏")
+	}
+	if string(data[:4]) != "PHON" {
+		return "", errors.New("phone.enc 魔数不匹配")
+	}
+	ver := data[4]
+	if ver != 1 {
+		return "", fmt.Errorf("不支持的加密版本: %d", ver)
+	}
+	key, err := derivePhoneKey()
+	if err != nil {
+		return "", err
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	if len(data) < 5+gcm.NonceSize() {
+		return "", errors.New("phone.enc 文件长度错误")
+	}
+	nonce := data[5 : 5+gcm.NonceSize()]
+	ciphertext := data[5+gcm.NonceSize():]
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return "", err
+	}
+	return string(plaintext), nil
+}
 
 // ============================================================================
 // 配置加载
@@ -1437,18 +1601,6 @@ func loadConfig() error {
 		}
 	}
 
-	// User Bot 配置
-	if os.Getenv("USE_USER_BOT") == "true" {
-		config.UseUserBot = true
-
-		// PHONE_NUMBER
-		if phoneNumber := os.Getenv("PHONE_NUMBER"); phoneNumber != "" {
-			config.PhoneNumber = phoneNumber
-		} else {
-			return errors.New("PHONE_NUMBER 是必需的")
-		}
-	}
-
 	return nil
 }
 
@@ -1483,9 +1635,18 @@ func main() {
 		log.Fatalf("启动客户端失败: %v", err)
 	}
 
-	// 启动 User Bot 客户端
-	if err := StartUserBot(); err != nil {
-		log.Fatalf("启动 User Bot 客户端失败: %v", err)
+	// 启动 User Bot 客户端（若未设置手机号则会被跳过）
+	phone, err := loadPhoneEncrypted()
+	if err != nil {
+		log.Printf("获取 PhoneNumber 失败: %v\n", err)
+	}
+	if phone != "" {
+		config.PhoneNumber = strings.TrimSpace(phone)
+		if err := StartUserBot(); err != nil {
+			log.Fatalf("启动 User Bot 客户端失败: %v", err)
+		}
+	} else {
+		log.Println("未设置 User Bot 手机号，跳过启动（可用 /phone 设置）")
 	}
 
 	// 设置 HTTP 路由
