@@ -27,7 +27,6 @@ import (
 	"github.com/celestix/gotgproto/storage"
 	"github.com/celestix/gotgproto/types"
 	"github.com/coocood/freecache"
-	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/gotd/td/tg"
 	"github.com/joho/godotenv"
@@ -46,10 +45,8 @@ type Config struct {
 	Port         int
 	Host         string
 	HashLength   int
-	AllowedUsers []int64
-	ProxyAddr    string // SOCKS5 代理地址，格式: host:port
-	ProxyUser    string // 代理用户名（可选）
-	ProxyPass    string // 代理密码（可选）
+	AdminUsers   []int64
+	TeleID       int64  // 机器人用户ID
 	UseUserBot   bool   // 是否使用 User Bot
 	PhoneNumber  string // User Bot 手机号（可选）
 }
@@ -130,7 +127,7 @@ func (c *Cache) Get(key string, value *File) error {
 		return err
 	}
 	dec := gob.NewDecoder(bytes.NewReader(data))
-	return dec.Decode(&value)
+	return dec.Decode(value)
 }
 
 func (c *Cache) Set(key string, value *File, expireSeconds int) error {
@@ -222,9 +219,9 @@ func LoadCommands(d dispatcher.Dispatcher) {
 	log.Println("命令处理器已加载")
 }
 
-// 管理员判断（使用 ALLOWED_USERS 作为管理员列表）
+// 管理员判断（使用 ADMIN_USERS 作为管理员列表）
 func isAdmin(userID int64) bool {
-	return len(config.AllowedUsers) > 0 && contains(config.AllowedUsers, userID)
+	return len(config.AdminUsers) > 0 && contains(config.AdminUsers, userID)
 }
 
 // /ban 命令：/ban <userID>
@@ -299,7 +296,7 @@ func handleStart(ctx *ext.Context, u *ext.Update) error {
 	}
 
 	/*
-		if len(config.AllowedUsers) > 0 && !contains(config.AllowedUsers, chatId) {
+		if len(config.adminUsers) > 0 && !contains(config.adminUsers, chatId) {
 			_, err := ctx.Reply(u, "您没有权限使用此机器人。", nil)
 			if err != nil {
 				log.Printf("发送未授权消息给用户 %d 失败: %v", chatId, err)
@@ -329,7 +326,7 @@ func handleMessage(ctx *ext.Context, u *ext.Update) error {
 		return dispatcher.EndGroups
 	}
 	/*
-		if len(config.AllowedUsers) > 0 && !contains(config.AllowedUsers, chatId) {
+		if len(config.adminUsers) > 0 && !contains(config.adminUsers, chatId) {
 			_, err := ctx.Reply(u, "您没有权限使用此机器人。", nil)
 			if err != nil {
 				log.Printf("发送未授权消息给用户 %d 失败: %v", chatId, err)
@@ -1011,42 +1008,35 @@ func notifyAdminWithUserAndLink(ctx *ext.Context, userID int64, link string, not
 
 	text := fmt.Sprintf("%s\n%s\n直链: %s", userLine, note, link)
 
-	// 优先：直接给管理员（ALLOWED_USERS）发送私聊消息，而不是发到频道
-	var sentCount int
-	for _, adminID := range config.AllowedUsers {
-		peer := ctx.PeerStorage.GetInputPeerById(adminID)
-		switch p := peer.(type) {
-		case *tg.InputPeerUser:
-			_, err := ctx.Raw.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-				Peer:      &tg.InputPeerUser{UserID: p.UserID, AccessHash: p.AccessHash},
-				Message:   text,
-				NoWebpage: true,
-				RandomID:  time.Now().UnixNano(),
-			})
-			if err == nil {
-				sentCount++
-			} else {
-				log.Printf("向管理员 %d 发送通知失败: %v", adminID, err)
-			}
-		default:
-			// 如果没有缓存到该管理员的对等体，暂时跳过（需要对方先与 Bot 对话以建立 peer）
-			log.Printf("管理员 %d 未建立对话，跳过通知", adminID)
+	params := map[string]any{
+		"chat_id": config.TeleID,
+		"text":    text,
+	}
+	body, err := json.Marshal(params)
+	if err != nil {
+		return err
+	}
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", config.BotToken)
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("向机器人 %d 发送通知失败: %v", config.TeleID, err)
+		return err
+	}
+
+	defer func() {
+		err := resp.Body.Close()
+		if err != nil {
+			log.Printf("关闭响应体失败: %v", err)
 		}
-	}
+	}()
 
-	if sentCount > 0 {
-		return nil
-	}
-
-	// 退化处理：如果没有可发送的管理员，则发到“自身”对话，避免发到频道。
-	// 注意：对于 Bot 账号，可能不支持 Self 对话，运行时失败则仅记录日志。
-	_, err := ctx.Raw.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-		Peer:      &tg.InputPeerSelf{},
-		Message:   text,
-		NoWebpage: true,
-		RandomID:  time.Now().UnixNano(),
-	})
-	return err
+	return nil
 }
 
 // ====== 辅助函数：hash 与时间格式 ======
@@ -1082,32 +1072,42 @@ func timeFormat(seconds uint64) string {
 }
 
 // ============================================================================
-// HTTP 路由
+// HTTP 路由（基于 net/http）
 // ============================================================================
 
-func setupRouter() *gin.Engine {
-	gin.SetMode(gin.ReleaseMode)
-	router := gin.Default()
+func setupRouter() http.Handler {
+	mux := http.NewServeMux()
 
-	router.GET("/", func(ctx *gin.Context) {
-		ctx.JSON(http.StatusOK, RootResponse{
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		resp := RootResponse{
 			Message: "服务器正在运行。",
 			Ok:      true,
 			Uptime:  timeFormat(uint64(time.Since(startTime).Seconds())),
 			Version: "3.1.0",
-		})
+		}
+		_ = json.NewEncoder(w).Encode(resp)
 	})
 
-	router.GET("/stream/:messageID", handleStream)
+	// stream 路由: 形如 /stream/{messageID 或 channelID_messageID}
+	mux.HandleFunc("/stream/", handleStream)
 
-	return router
+	return mux
 }
 
-func handleStream(ctx *gin.Context) {
-	w := ctx.Writer
-	r := ctx.Request
+func handleStream(w http.ResponseWriter, r *http.Request) {
+	// 解析 messageID 路径部分
+	path := strings.TrimPrefix(r.URL.Path, "/stream/")
+	if path == "" || strings.Contains(path, "/") {
+		http.Error(w, "无效的路径", http.StatusNotFound)
+		return
+	}
 
-	messageIDParam := ctx.Param("messageID")
+	messageIDParam := path
 
 	// 检查是否包含频道ID (格式: channelID_messageID)
 	var channelID int64
@@ -1144,7 +1144,7 @@ func handleStream(ctx *gin.Context) {
 		}
 	}
 
-	authHash := ctx.Query("hash")
+	authHash := r.URL.Query().Get("hash")
 	if authHash == "" {
 		http.Error(w, "缺少 hash 参数", http.StatusBadRequest)
 		return
@@ -1154,7 +1154,7 @@ func handleStream(ctx *gin.Context) {
 
 	if channelID != 0 {
 		// 从原频道获取文件
-		message, err := getTGMessageFromChannel(ctx, Bot, channelID, messageID)
+		message, err := getTGMessageFromChannel(r.Context(), Bot, channelID, messageID)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("获取消息失败: %v", err), http.StatusBadRequest)
 			return
@@ -1167,7 +1167,7 @@ func handleStream(ctx *gin.Context) {
 		}
 	} else {
 		// 从日志频道获取文件（兼容旧逻辑）
-		file, err = fileFromMessage(ctx, Bot, messageID)
+		file, err = fileFromMessage(r.Context(), Bot, messageID)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -1182,7 +1182,7 @@ func handleStream(ctx *gin.Context) {
 
 	// 处理照片
 	if file.FileSize == 0 {
-		res, err := Bot.API().UploadGetFile(ctx, &tg.UploadGetFileRequest{
+		res, err := Bot.API().UploadGetFile(r.Context(), &tg.UploadGetFileRequest{
 			Location: file.Location,
 			Offset:   0,
 			Limit:    1024 * 1024,
@@ -1197,14 +1197,16 @@ func handleStream(ctx *gin.Context) {
 			return
 		}
 		fileBytes := result.GetBytes()
-		ctx.Header("Content-Disposition", fmt.Sprintf("inline; filename=\"%s\"", file.FileName))
-		if r.Method != "HEAD" {
-			ctx.Data(http.StatusOK, file.MimeType, fileBytes)
+		w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=\"%s\"", file.FileName))
+		if r.Method != http.MethodHead {
+			w.Header().Set("Content-Type", file.MimeType)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(fileBytes)
 		}
 		return
 	}
 
-	ctx.Header("Accept-Ranges", "bytes")
+	w.Header().Set("Accept-Ranges", "bytes")
 	var start, end int64
 	rangeHeader := r.Header.Get("Range")
 
@@ -1214,13 +1216,13 @@ func handleStream(ctx *gin.Context) {
 		w.WriteHeader(http.StatusOK)
 	} else {
 		ranges, err := rangeParser.Parse(file.FileSize, rangeHeader)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		if err != nil || len(ranges) == 0 {
+			http.Error(w, "无效的 Range", http.StatusBadRequest)
 			return
 		}
 		start = ranges[0].Start
 		end = ranges[0].End
-		ctx.Header("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, file.FileSize))
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, file.FileSize))
 		w.WriteHeader(http.StatusPartialContent)
 	}
 
@@ -1230,16 +1232,16 @@ func handleStream(ctx *gin.Context) {
 		mimeType = "application/octet-stream"
 	}
 
-	ctx.Header("Content-Type", mimeType)
-	ctx.Header("Content-Length", strconv.FormatInt(contentLength, 10))
+	w.Header().Set("Content-Type", mimeType)
+	w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
 
 	disposition := "inline"
-	if ctx.Query("d") == "true" {
+	if r.URL.Query().Get("d") == "true" {
 		disposition = "attachment"
 	}
-	ctx.Header("Content-Disposition", fmt.Sprintf("%s; filename=\"%s\"", disposition, file.FileName))
+	w.Header().Set("Content-Disposition", fmt.Sprintf("%s; filename=\"%s\"", disposition, file.FileName))
 
-	if r.Method != "HEAD" {
+	if r.Method != http.MethodHead {
 		var reader io.ReadCloser
 		if channelID != 0 {
 			// 从原频道读取，优先使用 User Bot 下载（其拥有源频道访问权限），并支持自动刷新文件引用
@@ -1247,10 +1249,10 @@ func handleStream(ctx *gin.Context) {
 			if config.UseUserBot && UserBot != nil {
 				readerClient = UserBot
 			}
-			reader = newTelegramReaderWithRefresh(ctx, readerClient, file.Location, start, end, contentLength, channelID, messageID)
+			reader = newTelegramReaderWithRefresh(r.Context(), readerClient, file.Location, start, end, contentLength, channelID, messageID)
 		} else {
 			// 从日志频道读取，使用 Bot 即可
-			reader = newTelegramReader(ctx, Bot, file.Location, start, end, contentLength)
+			reader = newTelegramReader(r.Context(), Bot, file.Location, start, end, contentLength)
 		}
 		defer func() {
 			err := reader.Close()
@@ -1354,6 +1356,17 @@ func loadConfig() error {
 		Port:       8080,
 	}
 
+	//TELE_ID
+	if teleID := os.Getenv("TELE_ID"); teleID != "" {
+		id, err := strconv.ParseInt(teleID, 10, 64)
+		if err != nil {
+			return fmt.Errorf("无效的 TELE_ID: %v", err)
+		}
+		config.TeleID = id
+	} else {
+		return errors.New("TELE_ID 是必需的")
+	}
+
 	// API_ID
 	if apiID := os.Getenv("API_ID"); apiID != "" {
 		id, err := strconv.ParseInt(apiID, 10, 32)
@@ -1413,13 +1426,13 @@ func loadConfig() error {
 		}
 	}
 
-	// ALLOWED_USERS (可选)
-	if allowedUsers := os.Getenv("ALLOWED_USERS"); allowedUsers != "" {
-		ids := strings.Split(allowedUsers, ",")
+	// ADMIN_USERS (可选)
+	if adminUsers := os.Getenv("ADMIN_USERS"); adminUsers != "" {
+		ids := strings.Split(adminUsers, ",")
 		for _, id := range ids {
-			userId, err := strconv.ParseInt(strings.TrimSpace(id), 10, 64)
+			userID, err := strconv.ParseInt(strings.TrimSpace(id), 10, 64)
 			if err == nil {
-				config.AllowedUsers = append(config.AllowedUsers, userId)
+				config.AdminUsers = append(config.AdminUsers, userID)
 			}
 		}
 	}
@@ -1476,13 +1489,13 @@ func main() {
 	}
 
 	// 设置 HTTP 路由
-	router := setupRouter()
+	handler := setupRouter()
 
 	log.Printf("服务器正在 %s 运行\n", config.Host)
 	log.Printf("监听端口 %d\n", config.Port)
 
 	// 启动 HTTP 服务器
-	if err := router.Run(fmt.Sprintf(":%d", config.Port)); err != nil {
+	if err := http.ListenAndServe(fmt.Sprintf(":%d", config.Port), handler); err != nil {
 		log.Fatalf("启动服务器失败: %v", err)
 	}
 }
