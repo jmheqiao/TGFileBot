@@ -1011,13 +1011,37 @@ func notifyAdminWithUserAndLink(ctx *ext.Context, userID int64, link string, not
 
 	text := fmt.Sprintf("%s\n%s\n直链: %s", userLine, note, link)
 
-	// 发送到日志频道
-	toPeer, err := getLogChannelPeer(ctx, ctx.Raw, ctx.PeerStorage)
-	if err != nil {
-		return err
+	// 优先：直接给管理员（ALLOWED_USERS）发送私聊消息，而不是发到频道
+	var sentCount int
+	for _, adminID := range config.AllowedUsers {
+		peer := ctx.PeerStorage.GetInputPeerById(adminID)
+		switch p := peer.(type) {
+		case *tg.InputPeerUser:
+			_, err := ctx.Raw.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+				Peer:      &tg.InputPeerUser{UserID: p.UserID, AccessHash: p.AccessHash},
+				Message:   text,
+				NoWebpage: true,
+				RandomID:  time.Now().UnixNano(),
+			})
+			if err == nil {
+				sentCount++
+			} else {
+				log.Printf("向管理员 %d 发送通知失败: %v", adminID, err)
+			}
+		default:
+			// 如果没有缓存到该管理员的对等体，暂时跳过（需要对方先与 Bot 对话以建立 peer）
+			log.Printf("管理员 %d 未建立对话，跳过通知", adminID)
+		}
 	}
-	_, err = ctx.Raw.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-		Peer:      &tg.InputPeerChannel{ChannelID: toPeer.ChannelID, AccessHash: toPeer.AccessHash},
+
+	if sentCount > 0 {
+		return nil
+	}
+
+	// 退化处理：如果没有可发送的管理员，则发到“自身”对话，避免发到频道。
+	// 注意：对于 Bot 账号，可能不支持 Self 对话，运行时失败则仅记录日志。
+	_, err := ctx.Raw.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+		Peer:      &tg.InputPeerSelf{},
 		Message:   text,
 		NoWebpage: true,
 		RandomID:  time.Now().UnixNano(),
