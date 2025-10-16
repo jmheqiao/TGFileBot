@@ -1,48 +1,99 @@
-# 构建阶段 - 使用 Golang 1.23.0 版本
-FROM golang:1.23.0-alpine AS builder
+name: build TGFileBot
 
-# 定义构建参数，指定目标架构
-ARG TARGETARCH
-ARG TARGETOS
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  repository_dispatch:
+  workflow_dispatch:
 
-WORKDIR /tgfilebot
-COPY . .
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
-# 处理依赖
-RUN go mod tidy
+jobs:
+  build:
+    strategy:
+      matrix:
+        platform: [ubuntu-latest]
+        go-version: [ '1.23.2' ]
+    name: Build
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
 
-# 修正环境变量设置方式，正确传递GOOS和GOARCH
-RUN CGO_ENABLED=0 \
-    GOOS=${TARGETOS} \
-    GOARCH=${TARGETARCH} \
-    go build -ldflags "-s -w" \
-             -tags netgo \
-             -installsuffix netgo \
-             -o tgfilebot main.go
+      - name: Checkout
+        uses: actions/checkout@v4
+        
+      - name: Bump Version and Push Tag
+        id: bump
+        uses: anothrNick/github-tag-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WITH_V: false  # 不生成带v前缀的标签，如1.0.0而非v1.0.0
+          
+      - name: Build Go
+        run: |
+          set +e
+          GOOS=linux GOARCH=386 CGO_ENABLED=0 go build -ldflags "-s -w" -tags netgo -installsuffix netgo -o TGFileBot-linux-386
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -tags netgo -installsuffix netgo -o TGFileBot-linux-amd64
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "-s -w" -tags netgo -installsuffix netgo -o TGFileBot-linux-arm64
+          GOOS=freebsd GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -tags netgo -installsuffix netgo -o TGFileBot-freebsd-amd64
+          echo "DIR_NAME=$PWD" >> $GITHUB_ENV
+          echo ${{ steps.bump.outputs.new_tag }} >> TGFileBot-version
 
-# 运行阶段
-FROM alpine:3.20
+      - name: Upload Go to Release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.bump.outputs.new_tag }}
+          files: ${{ env.DIR_NAME }}/TGFileBot-*
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
 
-# 接收构建阶段的参数（保持一致性）
-ARG TARGETARCH
-ARG TARGETOS
+      - name: Login to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
 
-WORKDIR /root/
+      - name: Extract Metadata
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: lm317379829/tgfilebot
+          tags: |
+            type=raw,value=${{ steps.bump.outputs.new_tag }}
+            type=raw,value=latest
+     
+      # 构建并推送Docker镜像
+      - name: Build and Push
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-# 安装必要的系统工具
-RUN apk --no-cache add ca-certificates tzdata
-# 在工作目录创建配置文件（与程序读取路径一致）
-RUN touch blacklist.json
+      - name: Delete Workflow Runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          retain_days: 1
+          keep_minimum_runs: 3
 
-# 复制编译产物和配置文件
-COPY --from=builder /tgfilebot/tgfilebot .
-COPY --from=builder /tgfilebot/blacklist.json .
-
-
-EXPOSE 9981
-
-# 修正命令格式，拆分命令和参数
-CMD ["./tgfilebot"]
-
-# 设置默认的时区
-ENV TZ=Asia/Shanghai
+      - name: Remove Old Releases
+        uses: dev-drprasad/delete-older-releases@v0.1.0
+        with:
+          keep_latest: 3
+          delete_tags: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
