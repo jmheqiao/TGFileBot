@@ -155,6 +155,71 @@ func (c *Cache) Set(key string, value *File, expireSeconds int) error {
 
 var Bot *gotgproto.Client
 
+// BotAuthConversator 实现自定义认证流程，等待机器人发送验证码
+type BotAuthConversator struct {
+	phoneNumber string
+	codeChan    chan string
+	passChan    chan string
+}
+
+// NewBotAuthConversator 创建一个新的 BotAuthConversator
+func NewBotAuthConversator(phoneNumber string) *BotAuthConversator {
+	return &BotAuthConversator{
+		phoneNumber: phoneNumber,
+		codeChan:    make(chan string, 1),
+		passChan:    make(chan string, 1),
+	}
+}
+
+// AskPhoneNumber 返回配置的手机号
+func (b *BotAuthConversator) AskPhoneNumber() (string, error) {
+	log.Printf("使用手机号: %s\n", maskPhone(b.phoneNumber))
+	return b.phoneNumber, nil
+}
+
+// AskCode 等待用户通过机器人发送 /code 命令
+func (b *BotAuthConversator) AskCode() (string, error) {
+	log.Println("============================================")
+	log.Println("等待验证码...")
+	log.Println("请在 Telegram 机器人中发送: /code <验证码>")
+	log.Println("例如: /code 12345")
+	log.Println("============================================")
+
+	// 等待从 channel 接收验证码，设置超时时间为 5 分钟
+	select {
+	case code := <-b.codeChan:
+		log.Printf("已接收验证码: %s\n", code)
+		return code, nil
+	case <-time.After(5 * time.Minute):
+		return "", errors.New("等待验证码超时（5分钟）")
+	}
+}
+
+// AskPassword 请求两步验证密码
+func (b *BotAuthConversator) AskPassword() (string, error) {
+	log.Println("============================================")
+	log.Println("需要两步验证密码")
+	log.Println("请在 Telegram 机器人中发送: /pass <密码>")
+	log.Println("例如: /pass mypassword")
+	log.Println("============================================")
+
+	// 等待从 channel 接收密码，设置超时时间为 5 分钟
+	select {
+	case password := <-b.passChan:
+		log.Println("已接收两步验证密码")
+		return password, nil
+	case <-time.After(5 * time.Minute):
+		return "", errors.New("等待密码超时（5分钟）")
+	}
+}
+
+// AuthStatus 接收认证状态更新
+func (b *BotAuthConversator) AuthStatus(authStatus gotgproto.AuthStatus) {
+	log.Printf("认证状态更新: %+v (剩余尝试次数: %d)\n", authStatus.Event, authStatus.AttemptsLeft)
+}
+
+var userBotAuthConversator *BotAuthConversator // 全局变量，用于在命令处理器中访问
+
 func StartClient() error {
 	clientOpts := &gotgproto.ClientOpts{
 		Session:          sessionMaker.SqlSession(sqlite.Open("fsb.session")),
@@ -180,13 +245,18 @@ func StartClient() error {
 	return nil
 }
 
-// StartUserBot 启动 User Bot 客户端
+// StartUserBot 启动 User Bot 客户端，使用自定义认证流程
 func StartUserBot() error {
 	log.Println("正在启动 User Bot...")
+
+	// 创建自定义认证会话处理器
+	authConversator := NewBotAuthConversator(config.PhoneNumber)
+	userBotAuthConversator = authConversator // 保存到全局变量
 
 	clientOpts := &gotgproto.ClientOpts{
 		Session:          sessionMaker.SqlSession(sqlite.Open("userbot.session")),
 		DisableCopyright: true,
+		AuthConversator:  authConversator, // 使用自定义认证处理器
 	}
 
 	client, err := gotgproto.NewClient(
@@ -213,8 +283,9 @@ func LoadCommands(d dispatcher.Dispatcher) {
 	d.AddHandler(handlers.NewCommand("start", handleStart))
 	d.AddHandler(handlers.NewCommand("ban", handleBan))
 	d.AddHandler(handlers.NewCommand("unban", handleUnban))
-	// 新增 /phone 命令
 	d.AddHandler(handlers.NewCommand("phone", handlePhone))
+	d.AddHandler(handlers.NewCommand("code", handleCode))
+	d.AddHandler(handlers.NewCommand("pass", handlePass))
 	d.AddHandler(handlers.NewMessage(nil, handleMessage))
 	log.Println("命令处理器已加载")
 }
@@ -228,18 +299,18 @@ func isAdmin(userID int64) bool {
 func handleBan(ctx *ext.Context, u *ext.Update) error {
 	adminID := u.EffectiveChat().GetID()
 	if !isAdmin(adminID) {
-		_, _ = ctx.Reply(u, "无权执行此命令（仅限管理员）", nil)
+		_, _ = ctx.Reply(u, ext.ReplyTextString("无权执行此命令（仅限管理员）"), nil)
 		return dispatcher.EndGroups
 	}
 
 	args := strings.Fields(strings.TrimSpace(u.EffectiveMessage.Text))
 	if len(args) < 2 {
-		_, _ = ctx.Reply(u, "用法: /ban <用户ID>", nil)
+		_, _ = ctx.Reply(u, ext.ReplyTextString("用法: /ban <用户ID>"), nil)
 		return dispatcher.EndGroups
 	}
 	userID, err := strconv.ParseInt(args[1], 10, 64)
 	if err != nil {
-		_, _ = ctx.Reply(u, "无效的用户ID", nil)
+		_, _ = ctx.Reply(u, ext.ReplyTextString("无效的用户ID"), nil)
 		return dispatcher.EndGroups
 	}
 
@@ -249,9 +320,9 @@ func handleBan(ctx *ext.Context, u *ext.Update) error {
 	}
 
 	if created {
-		_, _ = ctx.Reply(u, fmt.Sprintf("已拉黑: %d", userID), nil)
+		_, _ = ctx.Reply(u, ext.ReplyTextString(fmt.Sprintf("已拉黑: %d", userID)), nil)
 	} else {
-		_, _ = ctx.Reply(u, fmt.Sprintf("用户已在黑名单: %d", userID), nil)
+		_, _ = ctx.Reply(u, ext.ReplyTextString(fmt.Sprintf("用户已在黑名单: %d", userID)), nil)
 	}
 	return dispatcher.EndGroups
 }
@@ -260,18 +331,18 @@ func handleBan(ctx *ext.Context, u *ext.Update) error {
 func handleUnban(ctx *ext.Context, u *ext.Update) error {
 	adminID := u.EffectiveChat().GetID()
 	if !isAdmin(adminID) {
-		_, _ = ctx.Reply(u, "无权执行此命令（仅限管理员）", nil)
+		_, _ = ctx.Reply(u, ext.ReplyTextString("无权执行此命令（仅限管理员）"), nil)
 		return dispatcher.EndGroups
 	}
 
 	args := strings.Fields(strings.TrimSpace(u.EffectiveMessage.Text))
 	if len(args) < 2 {
-		_, _ = ctx.Reply(u, "用法: /unban <用户ID>", nil)
+		_, _ = ctx.Reply(u, ext.ReplyTextString("用法: /unban <用户ID>"), nil)
 		return dispatcher.EndGroups
 	}
 	userID, err := strconv.ParseInt(args[1], 10, 64)
 	if err != nil {
-		_, _ = ctx.Reply(u, "无效的用户ID", nil)
+		_, _ = ctx.Reply(u, ext.ReplyTextString("无效的用户ID"), nil)
 		return dispatcher.EndGroups
 	}
 
@@ -280,9 +351,9 @@ func handleUnban(ctx *ext.Context, u *ext.Update) error {
 		log.Printf("保存黑名单失败: %v", saveErr)
 	}
 	if removed {
-		_, _ = ctx.Reply(u, fmt.Sprintf("已移出黑名单: %d", userID), nil)
+		_, _ = ctx.Reply(u, ext.ReplyTextString(fmt.Sprintf("已移出黑名单: %d", userID)), nil)
 	} else {
-		_, _ = ctx.Reply(u, fmt.Sprintf("用户不在黑名单: %d", userID), nil)
+		_, _ = ctx.Reply(u, ext.ReplyTextString(fmt.Sprintf("用户不在黑名单: %d", userID)), nil)
 	}
 	return dispatcher.EndGroups
 }
@@ -291,7 +362,7 @@ func handleUnban(ctx *ext.Context, u *ext.Update) error {
 func handlePhone(ctx *ext.Context, u *ext.Update) error {
 	adminID := u.EffectiveChat().GetID()
 	if !isAdmin(adminID) {
-		_, _ = ctx.Reply(u, "无权执行此命令（仅限管理员）", nil)
+		_, _ = ctx.Reply(u, ext.ReplyTextString("无权执行此命令（仅限管理员）"), nil)
 		return dispatcher.EndGroups
 	}
 
@@ -302,19 +373,19 @@ func handlePhone(ctx *ext.Context, u *ext.Update) error {
 		if masked != "" {
 			msg += fmt.Sprintf("\n当前已保存: %s", masked)
 		}
-		_, _ = ctx.Reply(u, msg, nil)
+		_, _ = ctx.Reply(u, ext.ReplyTextString(msg), nil)
 		return dispatcher.EndGroups
 	}
 
 	phone := strings.TrimSpace(args[1])
 	if !validPhone(phone) {
-		_, _ = ctx.Reply(u, "手机号格式不正确，请使用国际区号格式，例如 +8613800138000", nil)
+		_, _ = ctx.Reply(u, ext.ReplyTextString("手机号格式不正确，请使用国际区号格式，例如 +8613800138000"), nil)
 		return dispatcher.EndGroups
 	}
 
 	if err := savePhoneEncrypted(phone); err != nil {
 		log.Printf("保存加密手机号失败: %v", err)
-		_, _ = ctx.Reply(u, "保存失败，请查看服务端日志", nil)
+		_, _ = ctx.Reply(u, ext.ReplyTextString("保存失败，请查看服务端日志"), nil)
 		return dispatcher.EndGroups
 	}
 
@@ -324,14 +395,90 @@ func handlePhone(ctx *ext.Context, u *ext.Update) error {
 	if config.PhoneNumber != "" && UserBot == nil {
 		if err := StartUserBot(); err != nil {
 			log.Printf("设置手机号后启动 User Bot 失败: %v", err)
-			_, _ = ctx.Reply(u, "号码已保存，但启动 User Bot 失败，请查看日志或稍后重试", nil)
+			_, _ = ctx.Reply(u, ext.ReplyTextString("号码已保存，但启动 User Bot 失败，请查看日志或稍后重试"), nil)
 			return dispatcher.EndGroups
 		}
-		_, _ = ctx.Reply(u, "手机号已保存，User Bot 已启动。", nil)
+		_, _ = ctx.Reply(u, ext.ReplyTextString("手机号已保存，User Bot 已启动。"), nil)
 		return dispatcher.EndGroups
 	}
 
-	_, _ = ctx.Reply(u, "手机号已保存。若已在运行，将在下次重启后生效。", nil)
+	_, _ = ctx.Reply(u, ext.ReplyTextString("手机号已保存。若已在运行，将在下次重启后生效。"), nil)
+	return dispatcher.EndGroups
+}
+
+// /code 命令：/code <验证码>
+func handleCode(ctx *ext.Context, u *ext.Update) error {
+	adminID := u.EffectiveChat().GetID()
+	if !isAdmin(adminID) {
+		_, _ = ctx.Reply(u, ext.ReplyTextString("无权执行此命令（仅限管理员）"), nil)
+		return dispatcher.EndGroups
+	}
+
+	args := strings.Fields(strings.TrimSpace(u.EffectiveMessage.Text))
+	if len(args) < 2 {
+		_, _ = ctx.Reply(u, ext.ReplyTextString("用法: /code <验证码>\n例如: /code 12345"), nil)
+		return dispatcher.EndGroups
+	}
+
+	code := strings.TrimSpace(args[1])
+	if code == "" {
+		_, _ = ctx.Reply(u, ext.ReplyTextString("验证码不能为空"), nil)
+		return dispatcher.EndGroups
+	}
+
+	// 检查是否有等待验证码的 authConversator
+	if userBotAuthConversator == nil {
+		_, _ = ctx.Reply(u, ext.ReplyTextString("当前没有等待验证码的认证流程"), nil)
+		return dispatcher.EndGroups
+	}
+
+	// 尝试发送验证码到 channel
+	select {
+	case userBotAuthConversator.codeChan <- code:
+		_, _ = ctx.Reply(u, ext.ReplyTextString("✅ 验证码已提交"), nil)
+		log.Printf("管理员提交验证码: %s\n", code)
+	default:
+		_, _ = ctx.Reply(u, ext.ReplyTextString("验证码 channel 已满或当前不需要验证码"), nil)
+	}
+
+	return dispatcher.EndGroups
+}
+
+// /pass 命令：/pass <密码>
+func handlePass(ctx *ext.Context, u *ext.Update) error {
+	adminID := u.EffectiveChat().GetID()
+	if !isAdmin(adminID) {
+		_, _ = ctx.Reply(u, ext.ReplyTextString("无权执行此命令（仅限管理员）"), nil)
+		return dispatcher.EndGroups
+	}
+
+	args := strings.Fields(strings.TrimSpace(u.EffectiveMessage.Text))
+	if len(args) < 2 {
+		_, _ = ctx.Reply(u, ext.ReplyTextString("用法: /pass <密码>\n例如: /pass mypassword"), nil)
+		return dispatcher.EndGroups
+	}
+
+	password := strings.TrimSpace(args[1])
+	if password == "" {
+		_, _ = ctx.Reply(u, ext.ReplyTextString("密码不能为空"), nil)
+		return dispatcher.EndGroups
+	}
+
+	// 检查是否有等待密码的 authConversator
+	if userBotAuthConversator == nil {
+		_, _ = ctx.Reply(u, ext.ReplyTextString("当前没有等待密码的认证流程"), nil)
+		return dispatcher.EndGroups
+	}
+
+	// 尝试发送密码到 channel
+	select {
+	case userBotAuthConversator.passChan <- password:
+		_, _ = ctx.Reply(u, ext.ReplyTextString("✅ 密码已提交"), nil)
+		log.Println("管理员提交了两步验证密码")
+	default:
+		_, _ = ctx.Reply(u, ext.ReplyTextString("密码 channel 已满或当前不需要密码"), nil)
+	}
+
 	return dispatcher.EndGroups
 }
 
@@ -377,7 +524,7 @@ func handleStart(ctx *ext.Context, u *ext.Update) error {
 
 	/*
 		if len(config.adminUsers) > 0 && !contains(config.adminUsers, chatId) {
-			_, err := ctx.Reply(u, "您没有权限使用此机器人。", nil)
+			_, err := ctx.Reply(u, ext.ReplyTextString("您没有权限使用此机器人。"), nil)
 			if err != nil {
 				log.Printf("发送未授权消息给用户 %d 失败: %v", chatId, err)
 			}
@@ -385,7 +532,7 @@ func handleStart(ctx *ext.Context, u *ext.Update) error {
 		}
 	*/
 
-	_, err := ctx.Reply(u, "您好，发送任意文件即可获取该文件的直链。", nil)
+	_, err := ctx.Reply(u, ext.ReplyTextString("您好，发送任意文件即可获取该文件的直链。"), nil)
 	if err != nil {
 		log.Printf("发送欢迎消息给用户 %d 失败: %v", chatId, err)
 	}
@@ -416,12 +563,12 @@ func handleMessage(ctx *ext.Context, u *ext.Update) error {
 
 	// 黑名单拦截
 	if blacklist.IsBanned(chatId) {
-		_, _ = ctx.Reply(u, "您已被禁用，无法使用该机器人。", nil)
+		_, _ = ctx.Reply(u, ext.ReplyTextString("您已被禁用，无法使用该机器人。"), nil)
 		return dispatcher.EndGroups
 	}
 	/*
 		if len(config.adminUsers) > 0 && !contains(config.adminUsers, chatId) {
-			_, err := ctx.Reply(u, "您没有权限使用此机器人。", nil)
+			_, err := ctx.Reply(u, ext.ReplyTextString("您没有权限使用此机器人。"), nil)
 			if err != nil {
 				log.Printf("发送未授权消息给用户 %d 失败: %v", chatId, err)
 			}
@@ -454,7 +601,7 @@ func handleMessage(ctx *ext.Context, u *ext.Update) error {
 	// 转发消息到日志频道
 	update, err := forwardMessage(ctx, chatId, u.EffectiveMessage.ID)
 	if err != nil {
-		_, err := ctx.Reply(u, fmt.Sprintf("错误: %s", err.Error()), nil)
+		_, err := ctx.Reply(u, ext.ReplyTextString(fmt.Sprintf("错误: %s", err.Error())), nil)
 		if err != nil {
 			log.Printf("发送错误消息给用户 %d 失败: %v", chatId, err)
 		}
@@ -466,7 +613,7 @@ func handleMessage(ctx *ext.Context, u *ext.Update) error {
 
 	file, err := fileFromMedia(doc)
 	if err != nil {
-		_, err := ctx.Reply(u, fmt.Sprintf("错误: %s", err.Error()), nil)
+		_, err := ctx.Reply(u, ext.ReplyTextString(fmt.Sprintf("错误: %s", err.Error())), nil)
 		if err != nil {
 			log.Printf("发送错误消息给用户 %d 失败: %v", chatId, err)
 		}
@@ -495,7 +642,7 @@ func handleMessage(ctx *ext.Context, u *ext.Update) error {
 		Rows: []tg.KeyboardButtonRow{row},
 	}
 
-	_, err = ctx.Reply(u, fmt.Sprintf("直链: %s", link), &ext.ReplyOpts{
+	_, err = ctx.Reply(u, ext.ReplyTextString(fmt.Sprintf("直链: %s", link)), &ext.ReplyOpts{
 		Markup:           markup,
 		ReplyToMessageId: u.EffectiveMessage.ID,
 	})
@@ -600,7 +747,7 @@ func parseUsernameLink(text string) (username string, messageID int, err error) 
 // 通过用户名解析频道并返回 InputChannel 以及内部频道ID（-100前缀形式）
 func getChannelPeerByUsername(ctx context.Context, api *tg.Client, peerStorage *storage.PeerStorage, username string) (*tg.InputChannel, int64, error) {
 	uname := strings.TrimPrefix(username, "@")
-	res, err := api.ContactsResolveUsername(ctx, uname)
+	res, err := api.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{Username: uname})
 	if err != nil {
 		return nil, 0, fmt.Errorf("解析用户名失败: %v", err)
 	}
@@ -641,17 +788,17 @@ func handleTelegramLink(ctx *ext.Context, u *ext.Update, channelID int64, messag
 
 	message, err := getTGMessageFromChannel(ctx, Bot, channelID, messageID)
 	if err != nil {
-		_, _ = ctx.Reply(u, fmt.Sprintf("❌ 获取消息失败: %s\n\n💡 提示：请将机器人加入该频道，或开启 User Bot 仅用于读取以提升兼容性。", err.Error()), nil)
+		_, _ = ctx.Reply(u, ext.ReplyTextString(fmt.Sprintf("❌ 获取消息失败: %s\n\n💡 提示：请将机器人加入该频道，或开启 User Bot 仅用于读取以提升兼容性。", err.Error())), nil)
 		return dispatcher.EndGroups
 	}
 	if message.Media == nil {
-		_, _ = ctx.Reply(u, "❌ 该消息不包含文件", nil)
+		_, _ = ctx.Reply(u, ext.ReplyTextString("❌ 该消息不包含文件"), nil)
 		return dispatcher.EndGroups
 	}
 
 	file, err := fileFromMedia(message.Media)
 	if err != nil {
-		_, _ = ctx.Reply(u, fmt.Sprintf("❌ 提取文件失败: %s", err.Error()), nil)
+		_, _ = ctx.Reply(u, ext.ReplyTextString(fmt.Sprintf("❌ 提取文件失败: %s", err.Error())), nil)
 		return dispatcher.EndGroups
 	}
 
@@ -665,7 +812,7 @@ func handleTelegramLink(ctx *ext.Context, u *ext.Update, channelID int64, messag
 	}}
 	markup := &tg.ReplyInlineMarkup{Rows: []tg.KeyboardButtonRow{row}}
 
-	_, err = ctx.Reply(u, fmt.Sprintf("直链: %s", link), &ext.ReplyOpts{Markup: markup, ReplyToMessageId: u.EffectiveMessage.ID})
+	_, err = ctx.Reply(u, ext.ReplyTextString(fmt.Sprintf("直链: %s", link)), &ext.ReplyOpts{Markup: markup, ReplyToMessageId: u.EffectiveMessage.ID})
 	if err != nil {
 		log.Printf("发送直链消息给用户 %d 失败: %v", chatId, err)
 	}
@@ -685,17 +832,17 @@ func handleTelegramUsernameLink(ctx *ext.Context, u *ext.Update, username string
 
 	message, internalID, err := getTGMessageFromUsername(ctx, Bot, username, messageID)
 	if err != nil {
-		_, _ = ctx.Reply(u, fmt.Sprintf("❌ 获取消息失败: %s\n\n💡 提示：请将机器人加入该频道，或开启 User Bot 仅用于读取以提升兼容性。", err.Error()), nil)
+		_, _ = ctx.Reply(u, ext.ReplyTextString(fmt.Sprintf("❌ 获取消息失败: %s\n\n💡 提示：请将机器人加入该频道，或开启 User Bot 仅用于读取以提升兼容性。", err.Error())), nil)
 		return dispatcher.EndGroups
 	}
 	if message.Media == nil {
-		_, _ = ctx.Reply(u, "❌ 该消息不包含文件", nil)
+		_, _ = ctx.Reply(u, ext.ReplyTextString("❌ 该消息不包含文件"), nil)
 		return dispatcher.EndGroups
 	}
 
 	file, err := fileFromMedia(message.Media)
 	if err != nil {
-		_, _ = ctx.Reply(u, fmt.Sprintf("❌ 提取文件失败: %s", err.Error()), nil)
+		_, _ = ctx.Reply(u, ext.ReplyTextString(fmt.Sprintf("❌ 提取文件失败: %s", err.Error())), nil)
 		return dispatcher.EndGroups
 	}
 
@@ -710,7 +857,7 @@ func handleTelegramUsernameLink(ctx *ext.Context, u *ext.Update, username string
 
 	markup := &tg.ReplyInlineMarkup{Rows: []tg.KeyboardButtonRow{row}}
 
-	_, err = ctx.Reply(u, fmt.Sprintf("直链: %s", link), &ext.ReplyOpts{Markup: markup, ReplyToMessageId: u.EffectiveMessage.ID})
+	_, err = ctx.Reply(u, ext.ReplyTextString(fmt.Sprintf("直链: %s", link)), &ext.ReplyOpts{Markup: markup, ReplyToMessageId: u.EffectiveMessage.ID})
 	if err != nil {
 		log.Printf("发送直链消息给用户 %d 失败: %v", chatId, err)
 	}
@@ -1675,11 +1822,10 @@ type telegramReader struct {
 	buffer        []byte
 	bytesread     int64
 	chunkSize     int64
-	i             int64
+	pos           int64
 	contentLength int64
-	// For refresh support
-	channelID int64
-	messageID int
+	channelID     int64
+	messageID     int
 }
 
 func (r *telegramReader) Close() error {
@@ -1737,7 +1883,7 @@ func (r *telegramReader) Read(p []byte) (n int, err error) {
 		return 0, io.EOF
 	}
 
-	if r.i >= int64(len(r.buffer)) {
+	if r.pos >= int64(len(r.buffer)) {
 		r.buffer, err = r.next()
 		if err != nil {
 			// If we have channel info, try to refresh the file reference
@@ -1767,10 +1913,10 @@ func (r *telegramReader) Read(p []byte) (n int, err error) {
 				return 0, err
 			}
 		}
-		r.i = 0
+		r.pos = 0
 	}
-	n = copy(p, r.buffer[r.i:])
-	r.i += int64(n)
+	n = copy(p, r.buffer[r.pos:])
+	r.pos += int64(n)
 	r.bytesread += int64(n)
 	return n, nil
 }
