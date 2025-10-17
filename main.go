@@ -38,6 +38,11 @@ import (
 )
 
 // ============================================================================
+// 版本相关
+// ============================================================================
+var version = "v1.0.0"
+
+// ============================================================================
 // 配置相关
 // ============================================================================
 
@@ -511,6 +516,19 @@ func maskPhone(p string) string {
 		return "****"
 	}
 	return string(runes[:2]) + strings.Repeat("*", len(runes)-4) + string(runes[len(runes)-2:])
+}
+
+// maskSecret 用于对敏感字符串做脱敏显示（保留前后各2位）
+func maskSecret(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= 6 {
+		return strings.Repeat("*", len(r))
+	}
+	return string(r[:2]) + strings.Repeat("*", len(r)-4) + string(r[len(r)-2:])
 }
 
 // 恢复 /start 处理器
@@ -1317,7 +1335,7 @@ func setupRouter() http.Handler {
 			Message: "服务器正在运行。",
 			Ok:      true,
 			Uptime:  timeFormat(uint64(time.Since(startTime).Seconds())),
-			Version: "3.2.0",
+			Version: version,
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})
@@ -1656,6 +1674,28 @@ func loadPhoneEncrypted() (string, error) {
 // ============================================================================
 
 func loadConfig() error {
+	// 使用 defer 在函数结束时输出配置（仅在成功时）
+	success := false
+	defer func() {
+		if success && config != nil {
+			log.Println("配置详情:")
+			log.Printf("  Host: %s", config.Host)
+			log.Printf("  Port: %d", config.Port)
+			log.Printf("  ApiID: %d", config.ApiID)
+			log.Printf("  ApiHash: %s", maskSecret(config.ApiHash))
+			log.Printf("  BotToken: %s", maskSecret(config.BotToken))
+			log.Printf("  LogChannelID: %d", config.LogChannelID)
+			log.Printf("  TELE_ID: %d", config.TeleID)
+			log.Printf("  HashLength: %d", config.HashLength)
+			if len(config.AdminUsers) > 0 {
+				log.Printf("  AdminUsers: %v", config.AdminUsers)
+			}
+			if strings.TrimSpace(config.PhoneNumber) != "" {
+				log.Printf("  PhoneNumber: %s", maskPhone(config.PhoneNumber))
+			}
+		}
+	}()
+
 	// 尝试加载 .env 文件
 	err := godotenv.Load(".env")
 	if err != nil {
@@ -1748,6 +1788,7 @@ func loadConfig() error {
 		}
 	}
 
+	success = true
 	return nil
 }
 
@@ -1785,7 +1826,9 @@ func main() {
 	// 启动 User Bot 客户端（若未设置手机号则会被跳过）
 	phone, err := loadPhoneEncrypted()
 	if err != nil {
-		log.Printf("获取 PhoneNumber 失败: %v\n", err)
+		if !os.IsNotExist(err) {
+			log.Printf("获取 PhoneNumber 失败: %v\n", err)
+		}
 	}
 	if phone != "" {
 		config.PhoneNumber = strings.TrimSpace(phone)
