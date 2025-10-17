@@ -1317,7 +1317,7 @@ func setupRouter() http.Handler {
 			Message: "服务器正在运行。",
 			Ok:      true,
 			Uptime:  timeFormat(uint64(time.Since(startTime).Seconds())),
-			Version: "3.1.0",
+			Version: "3.2.0",
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})
