@@ -777,7 +777,7 @@ func getChannelPeerByUsername(ctx context.Context, api *tg.Client, peerStorage *
 	input := ch.AsInput()
 
 	// 计算 -100 前缀的内部频道ID（用于直链）
-	internalID := int64(-1000000000000) - int64(input.ChannelID)
+	internalID := int64(-1000000000000) - input.ChannelID
 	return input, internalID, nil
 }
 
