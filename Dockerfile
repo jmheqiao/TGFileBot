@@ -1,5 +1,5 @@
 # 构建阶段 - 使用 Golang 1.23.0 版本
-FROM golang:1.23.0-alpine AS builder
+FROM golang:1.24-alpine AS builder
 
 # 定义构建参数，指定目标架构
 ARG TARGETARCH
