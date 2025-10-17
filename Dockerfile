@@ -30,6 +30,7 @@ COPY --from=builder /tgfilebot/tgfilebot .
 
 # 确保配置文件存在
 RUN touch blacklist.json
+RUN echo -n "[]" > blacklist.json
 
 EXPOSE 9981
 
