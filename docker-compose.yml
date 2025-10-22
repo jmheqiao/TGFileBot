@@ -1,0 +1,12 @@
+version: '3.8'
+services:
+  tgfilebot:
+    image: lm317379829/tgfilebot:latest
+    restart: unless-stopped
+    ports:
+      - "9981:9981"
+    volumes:
+      - ./files:/root/files
+    env_file:
+      - ./files/.env
+

@@ -2,7 +2,6 @@
 
 ## 项目简介 | Project Introduction
 本项目是一个 Telegram 机器人，支持为 Telegram 频道/群组中的文件生成直接下载链接（直链），支持断点续传、在线播放等功能。适合个人或团队部署，实现文件分享自动化。
-This project is a Telegram bot that generates direct download links for files in Telegram channels/groups, supporting HTTP Range requests, resume download, and online playback. Suitable for personal or team deployment to automate file sharing.
 
 ## 项目功能 | Features
 - 生成 Telegram 文件的直链，支持 HTTP Range 请求
@@ -19,7 +18,6 @@ This project is a Telegram bot that generates direct download links for files in
 ## 技术栈 | Tech Stack
 - Go 1.21+
 - [gotgproto](https://github.com/celestix/gotgproto) (Telegram 客户端)
-- [Gin](https://github.com/gin-gonic/gin) (HTTP 框架)
 - SQLite (会话存储)
 - FreeCache (文件信息缓存)
 
@@ -45,7 +43,6 @@ This project is a Telegram bot that generates direct download links for files in
 - `HOST`：服务地址（如 http://localhost:8080 或 https://your-domain.com）
 - `HASH_LENGTH`：直链 hash 长度，默认 6
 - `ADMIN_USERS`：管理机器人的 Telegram 用户 ID，逗号分隔（**强烈推荐设置**）
-- `PHONE_NUMBER`：User Bot 手机号（可选，格式如 +8613800138000）
 
 ## 使用示例 | Usage Example
 
@@ -131,7 +128,7 @@ A: 直链包含安全 hash 校验，防止非法访问。Hash 基于文件名、
 A: 默认缓存 1 小时，使用 FreeCache 存储（最大 10MB）。
 
 **Q: 如何添加/移除管理员？**  
-A: 修改 `.env` 中的 `ADMIN_USERS` 参数，重启服务。
+A: 修改 `.env` 或 docker 环境变量中的 `ADMIN_USERS` 参数，重启服务。
 
 **Q: User Bot 和普通 Bot 有什么区别？**  
 A: User Bot 使用真实用户账号登录，可以访问用户加入的所有频道和群组；普通 Bot 只能访问明确添加它的频道。
@@ -140,7 +137,7 @@ A: User Bot 使用真实用户账号登录，可以访问用户加入的所有�
 A: 使用 AES-256-GCM 加密，密钥基于 SHA-256 哈希派生。但仍建议在可信环境部署，避免配置文件泄露。
 
 **Q: 如果验证码输入错误怎么办？**  
-A: 验证码有多次尝试机会。如果失败，需要删除 `userbot.session` 文件并重新启动服务。
+A: 验证码有多次尝试机会。如果失败，需要删除 `files/userbot.session` 文件并重新启动服务。
 
 **Q: 支持哪些文件类型？**  
 A: 支持所有 Telegram 支持的文件类型，包括文档、图片、视频、音频等。
@@ -148,16 +145,71 @@ A: 支持所有 Telegram 支持的文件类型，包括文档、图片、视频�
 ## 项目结构  Project Structure
 ```
 TGFileBot/
-├── main.go              # 主程序
-├── go.mod               # Go 模块配置
-├── go.sum               # 依赖校验
-├── .env                 # 配置文件（需自行创建）
-├── sample.zh.env        # 配置示例
-├── fsb.session          # Bot 会话文件（自动生成）
-├── userbot.session      # User Bot 会话文件（自动生成）
-├── phone.enc            # 加密的手机号（自动生成）
-└── README.md            # 本文件
+├── `main.go`              \# 主程序
+├── `go.mod`               \# Go 模块配置
+├── `go.sum`               \# 依赖校验
+├── `sample.zh.env`        \# 配置示例
+├── `README.md`            \# 本文件
+├── `files/`
+│   ├── `fsb.session`        \# Bot 会话文件（自动生成）
+│   ├── `userbot.session`    \# User Bot 会话文件（自动生成）
+│   ├── `phone.enc`         \# 加密的手机号（自动生成）
+│   └── `.env`              \# 配置文件
+└── `LICENSE`
 ```
+
+## Docker 部署 / Docker usage
+本项目提供已发布镜像 `lm317379829/tgfilebot`（镜像名以实际仓库为准），镜像中应用的工作目录为 `/root/`，并在容器中使用 `/root/files` 存放会话文件和配置文件。请将本地的 `files` 目录挂载到容器的 `/root/files`，并确保 `files/.env`、`files/blacklist.json` 等必要文件在宿主机上存在，否则在挂载后容器内的默认文件会被覆盖。
+
+- 容器内部路径：`/root/files`
+- 建议映射端口：`9981:9981`（镜像 Dockerfile 中 EXPOSE 了 9981）
+
+Windows (cmd.exe) 示例：
+```cmd
+rem 在仓库根目录运行
+if not exist "files" mkdir files
+if not exist "files\\blacklist.json" echo []>files\\blacklist.json
+copy sample.zh.env files\\.env
+
+docker run -d --name tgfilebot \
+  -p 9981:9981 \
+  -v "%cd%/files:/root/files" \
+  --env-file "%cd%/files/.env" \
+  lm317379829/tgfilebot:latest
+```
+
+Linux / macOS (sh) 示例：
+```sh
+# 在仓库根目录运行
+mkdir -p files
+[ -f files/blacklist.json ] || echo -n "[]" > files/blacklist.json
+cp sample.zh.env files/.env
+
+docker run -d --name tgfilebot \
+  -p 9981:9981 \
+  -v "$(pwd)/files:/root/files" \
+  --env-file "$(pwd)/files/.env" \
+  lm317379829/tgfilebot:latest
+```
+
+docker-compose 示例（文件：`docker-compose.yml`）：
+```yaml
+version: '3.8'
+services:
+  tgfilebot:
+    image: lm317379829/tgfilebot:latest
+    restart: unless-stopped
+    ports:
+      - "9981:9981"
+    volumes:
+      - ./files:/root/files
+    env_file:
+      - ./files/.env
+```
+
+注意事项：
+- 当你使用 `-v ./files:/root/files` 将宿主目录挂载到容器时，容器镜像内的 `/root/files` 会被挂载点遮盖；如果宿主机 `files` 目录中不存在 `blacklist.json`、`.env` 或 `.session` 文件，需要先在宿主机上创建或复制（参见示例）。
+- 如果你希望在容器启动时由镜像自动创建 `blacklist.json` 等文件，可以在不挂载 `files` 的情况下先运行一次容器让镜像初始化文件，然后再将宿主目录中的文件拷贝出来（不推荐在生产中这样做）。
 
 ## 贡献指南  Contributing
 欢迎提交 Issue 和 Pull Request。请遵循 [Go 代码规范](https://golang.org/doc/effective_go.html)。

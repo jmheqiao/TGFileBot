@@ -227,7 +227,7 @@ var userBotAuthConversator *BotAuthConversator // 全局变量，用于在命令
 
 func StartClient() error {
 	clientOpts := &gotgproto.ClientOpts{
-		Session:          sessionMaker.SqlSession(sqlite.Open("fsb.session")),
+		Session:          sessionMaker.SqlSession(sqlite.Open("files/fsb.session")),
 		DisableCopyright: true,
 	}
 
@@ -259,7 +259,7 @@ func StartUserBot() error {
 	userBotAuthConversator = authConversator // 保存到全局变量
 
 	clientOpts := &gotgproto.ClientOpts{
-		Session:          sessionMaker.SqlSession(sqlite.Open("userbot.session")),
+		Session:          sessionMaker.SqlSession(sqlite.Open("files/userbot.session")),
 		DisableCopyright: true,
 		AuthConversator:  authConversator, // 使用自定义认证处理器
 	}
@@ -1585,13 +1585,13 @@ func (b *Blacklist) Unban(id int64) bool {
 	return existed
 }
 
-var blacklist = NewBlacklist("blacklist.json")
+var blacklist = NewBlacklist("files/blacklist.json")
 
 // ============================================================================
 // 加密存储：User Bot 手机号
 // ============================================================================
 
-const phoneFile = "phone.enc"
+const phoneFile = "files/phone.enc"
 
 func derivePhoneKey() ([]byte, error) {
 	// 由 API_HASH + BOT_TOKEN + TELE_ID 派生密钥（32字节）
@@ -1697,14 +1697,14 @@ func loadConfig() error {
 	}()
 
 	// 尝试加载 .env 文件
-	err := godotenv.Load(".env")
+	err := godotenv.Load("files/.env")
 	if err != nil {
 		log.Println("未找到 .env 文件，继续使用环境变量")
 	}
 
 	config = &Config{
 		HashLength: 6,
-		Port:       8080,
+		Port:       9981,
 	}
 
 	//TELE_ID
